@@ -1,0 +1,26 @@
+{
+  "name": "solana-max-bundler",
+  "version": "2.0.0",
+  "scripts": {
+    "start": "ts-node src/index.ts",
+    "build": "tsc",
+    "start:built": "node dist/index.js"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0",
+    "@solana/spl-token": "^0.4.0",
+    "@raydium-io/raydium-sdk-v2": "^0.1.0",
+    "bn.js": "^5.2.1",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.4.0",
+    "chalk": "^4.1.2",
+    "ora": "^5.4.1",
+    "axios": "^1.7.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "ts-node": "^10.9.0",
+    "@types/node": "^20.0.0",
+    "@types/bn.js": "^5.1.0"
+  }
+}
