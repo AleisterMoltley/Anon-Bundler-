@@ -8,6 +8,7 @@ import {
 } from "@solana/web3.js";
 import bs58 from "bs58";
 import axios from "axios";
+import crypto from "crypto";
 import { CONFIG } from "./config";
 import { getDynamicTipAccounts, log, retry, sleep } from "./utils";
 
@@ -27,7 +28,7 @@ async function buildTipTransaction(
   tipLamports: number
 ): Promise<VersionedTransaction> {
   const tipAccounts = await getDynamicTipAccounts();
-  const tipAccount = tipAccounts[Math.floor(Math.random() * tipAccounts.length)]!;
+  const tipAccount = tipAccounts[crypto.randomInt(tipAccounts.length)]!;
 
   const blockhash = await connection.getLatestBlockhash("confirmed");
 
