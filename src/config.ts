@@ -32,7 +32,7 @@ export const CONFIG = {
   masterPrivateKey: requireEnv("MASTER_PRIVATE_KEY"),
 
   // Mode
-  mode: (optionalEnv("MODE", "pump")).toLowerCase() as "pump" | "raydium" | "multi",
+  mode: optionalEnv("MODE", "pump").toLowerCase() as "pump" | "raydium" | "multi",
 
   // Token config
   tokenName: optionalEnv("TOKEN_NAME", "MyToken"),
@@ -43,18 +43,24 @@ export const CONFIG = {
   // Wallet config
   numWallets: intEnv("NUM_WALLETS", 20, 1, 300),
   solPerWallet: floatEnv("SOL_PER_WALLET", 0.28),
-  bundleWalletsCount: intEnv("BUNDLE_WALLETS_COUNT", 4, 1, 4),
+
+  // FIX #3/#14: Max 3 bundle wallets (create TX + 3 buyers + tip = 5 Jito max)
+  bundleWalletsCount: intEnv("BUNDLE_WALLETS_COUNT", 3, 1, 3),
+
   jitoTipLamports: intEnv("JITO_TIP_LAMPORTS", 950_000, 100_000, 10_000_000),
   vanityPrefix: optionalEnv("VANITY_PREFIX", ""),
   vanityTimeoutSec: intEnv("VANITY_TIMEOUT_SEC", 30, 5, 300),
 
-  // Slippage — capped at 10% max (H3 fix)
+  // Slippage — capped at 10% max
   slippageBps: intEnv("SLIPPAGE_BPS", 500, 50, 1000),
+
+  // FIX #13: Creator buy amount configurable
+  creatorBuySol: floatEnv("CREATOR_BUY_SOL", 0.5),
 
   // Post-launch
   autoMigrate: process.env.AUTO_MIGRATE !== "false",
   volumeEnabled: process.env.VOLUME_BOT_ENABLED !== "false",
-  volumeBuysPerMin: intEnv("VOLUME_BUYS_PER_MIN", 12, 1, 60),
+  volumeBuysPerMin: intEnv("VOLUME_BUYS_PER_MIN", 12, 1, 30), // FIX #17: Cap at 30 to avoid rate limits
   autoSellPercent: intEnv("AUTO_SELL_PERCENT", 35, 5, 95),
 
   // Metadata
@@ -65,7 +71,6 @@ export const CONFIG = {
   dryRun: process.env.DRY_RUN === "true",
 };
 
-// Startup validation
 export function validateConfig() {
   if (CONFIG.masterPrivateKey.length < 40) {
     throw new Error("MASTER_PRIVATE_KEY looks invalid (too short)");
@@ -73,6 +78,15 @@ export function validateConfig() {
   if (!CONFIG.rpcUrl.startsWith("https://")) {
     throw new Error("RPC_URL must use HTTPS");
   }
+
+  // FIX #4: Require vault password for real launches
+  if (!CONFIG.dryRun && !CONFIG.walletVaultPassword) {
+    throw new Error(
+      "WALLET_VAULT_PASSWORD is required for non-dry-run launches. " +
+        "Generated wallet private keys will be written to disk — set a password to encrypt them."
+    );
+  }
+
   if (CONFIG.dryRun) {
     console.log("⚠️  DRY_RUN mode active — no transactions will be sent onchain");
   }

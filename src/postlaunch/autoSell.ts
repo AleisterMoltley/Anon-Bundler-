@@ -2,12 +2,11 @@ import {
   Connection,
   Keypair,
   PublicKey,
-  LAMPORTS_PER_SOL,
   VersionedTransaction,
 } from "@solana/web3.js";
 import axios from "axios";
 import { CONFIG } from "../config";
-import { sleep, log } from "../utils";
+import { sleep, log, jupiterLimiter } from "../utils";
 
 const JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote";
 const JUPITER_SWAP_API = "https://quote-api.jup.ag/v6/swap";
@@ -26,6 +25,7 @@ interface PriceState {
  */
 async function getTokenPrice(mint: PublicKey): Promise<number | null> {
   try {
+    await jupiterLimiter.wait();
     const res = await axios.get(JUPITER_PRICE_API, {
       params: { ids: mint.toBase58() },
       timeout: 10_000,
@@ -38,7 +38,7 @@ async function getTokenPrice(mint: PublicKey): Promise<number | null> {
 }
 
 /**
- * Execute a sell of a percentage of token holdings
+ * Execute a sell of token holdings
  */
 async function sellTokens(
   connection: Connection,
@@ -47,6 +47,8 @@ async function sellTokens(
   tokenAmount: bigint
 ): Promise<string | null> {
   try {
+    await jupiterLimiter.wait();
+
     const quoteRes = await axios.get(JUPITER_QUOTE_API, {
       params: {
         inputMint: mint.toBase58(),
@@ -58,6 +60,8 @@ async function sellTokens(
     });
 
     if (!quoteRes.data) return null;
+
+    await jupiterLimiter.wait();
 
     const swapRes = await axios.post(
       JUPITER_SWAP_API,
@@ -98,8 +102,7 @@ async function getTokenBalance(
   try {
     const accounts = await connection.getTokenAccountsByOwner(wallet, { mint });
     if (accounts.value.length === 0) return BigInt(0);
-
-    const info = await connection.getTokenAccountBalance(accounts.value[0].pubkey);
+    const info = await connection.getTokenAccountBalance(accounts.value[0]!.pubkey);
     return BigInt(info.value.amount);
   } catch {
     return BigInt(0);
@@ -107,7 +110,49 @@ async function getTokenBalance(
 }
 
 /**
+ * Execute sells across master + buyer wallets
+ * Extracted to avoid code duplication between profit target and trailing stop
+ *
+ * FIX #7: Shared sell logic so trailing stop actually sells
+ */
+async function executeSellAll(
+  connection: Connection,
+  mint: PublicKey,
+  masterWallet: Keypair,
+  buyerWallets: Keypair[],
+  reason: string
+): Promise<void> {
+  log.success(`Selling all positions — reason: ${reason}`);
+
+  // Sell from master wallet first (50% of holdings)
+  const masterBalance = await getTokenBalance(connection, masterWallet.publicKey, mint);
+  if (masterBalance > BigInt(0)) {
+    const sellAmount = (masterBalance * BigInt(50)) / BigInt(100);
+    const sig = await sellTokens(connection, masterWallet, mint, sellAmount);
+    if (sig) {
+      log.success(`Master auto-sell executed: ${sig.slice(0, 16)}...`);
+    }
+  }
+
+  // Sell from buyer wallets (100% of holdings)
+  for (const wallet of buyerWallets.slice(0, CONFIG.bundleWalletsCount)) {
+    const balance = await getTokenBalance(connection, wallet.publicKey, mint);
+    if (balance > BigInt(0)) {
+      const sig = await sellTokens(connection, wallet, mint, balance);
+      if (sig) {
+        log.info(`Buyer ${wallet.publicKey.toBase58().slice(0, 8)} sold (sig: ${sig.slice(0, 16)}...)`);
+      }
+      await sleep(2000); // Stagger sells
+    }
+  }
+
+  log.success("Auto-sell complete.");
+}
+
+/**
  * Start auto-sell monitor with real price tracking and sell execution
+ *
+ * FIX #7: Trailing stop now actually triggers sell execution
  */
 export function startAutoSellMonitor(
   connection: Connection,
@@ -158,40 +203,37 @@ export function startAutoSellMonitor(
 
         // Check if we hit profit target
         if (profitPercent >= targetProfitPercent && state.soldPercent < 100) {
-          log.success(`Auto-sell triggered! Profit: +${profitPercent.toFixed(1)}% (target: +${targetProfitPercent}%)`);
+          log.success(
+            `Profit target triggered! Profit: +${profitPercent.toFixed(1)}% (target: +${targetProfitPercent}%)`
+          );
 
-          // Sell from master wallet first
-          const masterBalance = await getTokenBalance(connection, masterWallet.publicKey, mint);
-          if (masterBalance > BigInt(0)) {
-            const sellAmount = (masterBalance * BigInt(50)) / BigInt(100); // Sell 50% of holdings
-            const sig = await sellTokens(connection, masterWallet, mint, sellAmount);
-            if (sig) {
-              log.success(`Master auto-sell executed: ${sig.slice(0, 16)}...`);
-            }
-          }
-
-          // Sell from buyer wallets
-          for (const wallet of buyerWallets.slice(0, CONFIG.bundleWalletsCount)) {
-            const balance = await getTokenBalance(connection, wallet.publicKey, mint);
-            if (balance > BigInt(0)) {
-              const sig = await sellTokens(connection, wallet, mint, balance);
-              if (sig) {
-                log.info(`Buyer ${wallet.publicKey.toBase58().slice(0, 8)} sold (sig: ${sig.slice(0, 16)}...)`);
-              }
-              await sleep(2000); // Stagger sells
-            }
-          }
+          await executeSellAll(
+            connection,
+            mint,
+            masterWallet,
+            buyerWallets,
+            `profit target +${profitPercent.toFixed(1)}%`
+          );
 
           state.soldPercent = 100;
-          log.success("Auto-sell complete. Monitor continues watching.");
         }
 
-        // Trailing stop: if price drops 20% from ATH after profit target
+        // FIX #7: Trailing stop — actually execute sells (was just setting flag before)
         if (state.soldPercent === 0 && state.highestPrice > 0) {
           const dropFromHigh = ((state.highestPrice - price) / state.highestPrice) * 100;
           if (dropFromHigh >= 20 && profitPercent > 10) {
-            log.warn(`Trailing stop: price dropped ${dropFromHigh.toFixed(1)}% from ATH, triggering sell`);
-            // Trigger same sell logic as above
+            log.warn(
+              `Trailing stop: price dropped ${dropFromHigh.toFixed(1)}% from ATH (profit still +${profitPercent.toFixed(1)}%)`
+            );
+
+            await executeSellAll(
+              connection,
+              mint,
+              masterWallet,
+              buyerWallets,
+              `trailing stop -${dropFromHigh.toFixed(1)}% from ATH`
+            );
+
             state.soldPercent = 100;
           }
         }

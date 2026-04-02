@@ -8,6 +8,12 @@ import {
 import { log, confirmTx, retry, sleep } from "./utils";
 import { CONFIG } from "./config";
 
+/**
+ * Create an Address Lookup Table for compact transactions.
+ * NOTE: Currently the LUT is created for future use (e.g. post-launch swaps).
+ * The initial Jito bundle uses standard V0 transactions without LUT references
+ * because the LUT needs ~1 slot to become active onchain.
+ */
 export async function createLUT(
   connection: Connection,
   payer: Keypair,
@@ -28,7 +34,6 @@ export async function createLUT(
         recentSlot: slot,
       });
 
-      // LUT can hold max 256 addresses, but extend instruction is limited
       const addrSlice = addresses.slice(0, 180);
 
       const extendIx = AddressLookupTableProgram.extendLookupTable({
@@ -40,15 +45,12 @@ export async function createLUT(
 
       const tx = new Transaction().add(createIx, extendIx);
 
-      // M2 fix: Actually wait for confirmation
       const sig = await connection.sendTransaction(tx, [payer], {
         skipPreflight: false,
         preflightCommitment: "confirmed",
       });
 
       await confirmTx(connection, sig, "confirmed");
-
-      // Wait for LUT to be available onchain
       await sleep(2000);
 
       log.success(`LUT created: ${lutAddr.toBase58()} (${addrSlice.length} addresses)`);

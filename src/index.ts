@@ -55,7 +55,7 @@ function setupShutdown() {
 // === Main Flow ===
 
 async function main() {
-  console.log(chalk.bold.magenta("\n🔥 SOLANA MAX BUNDLER 2026\n"));
+  console.log(chalk.bold.magenta("\n🔥 SOLANA MAX BUNDLER v2.1\n"));
 
   // Step: Init
   validateConfig();
@@ -67,6 +67,8 @@ async function main() {
   log.info(`Mode: ${CONFIG.mode}`);
   log.info(`Master: ${master.publicKey.toBase58()}`);
   log.info(`Wallets: ${CONFIG.numWallets} × ${CONFIG.solPerWallet} SOL`);
+  log.info(`Bundle buyers: ${CONFIG.bundleWalletsCount} (Jito limit: 3 + 1 create + 1 tip = 5)`);
+  log.info(`Creator buy: ${CONFIG.creatorBuySol} SOL`);
   log.info(`Slippage: ${CONFIG.slippageBps} bps (${CONFIG.slippageBps / 100}%)`);
   if (CONFIG.dryRun) log.warn("DRY_RUN mode active");
 
@@ -80,7 +82,7 @@ async function main() {
   log.step("Step 2/5: Funding wallets...");
   await fundWallets(connection, master, state.buyerWallets);
 
-  // Step: Create LUT
+  // Step: Create LUT (for post-launch use)
   state.step = "lut";
   log.step("Step 3/5: Creating Address Lookup Table...");
   await createLUT(connection, master, [
@@ -103,7 +105,7 @@ async function main() {
   state.mint = launchResult.mint;
   console.log(chalk.green.bold(`\n🎉 Token: ${state.mint.toBase58()}\n`));
 
-  // Step: Send Jito Bundle (K2 fix: pass actual transactions)
+  // Step: Send Jito Bundle
   state.step = "bundle";
   if (launchResult.transactions.length > 0) {
     log.step("Step 5/5: Sending Jito bundle...");
@@ -114,12 +116,12 @@ async function main() {
       master
     );
 
-    // Wait for bundle confirmation
     if (state.bundleId && state.bundleId !== "dry-run-bundle-id") {
       const confirmed = await waitForBundleConfirmation(state.bundleId);
       if (!confirmed) {
         log.error("Bundle was not confirmed — token may not have launched correctly");
         log.info("Check transaction status manually and decide whether to continue");
+        log.info("Run `npm run recover` to reclaim SOL from buyer wallets if needed");
       }
     }
   } else {
@@ -153,7 +155,6 @@ async function main() {
   console.log(chalk.bold.green("\n✅ ALL SYSTEMS RUNNING"));
   console.log(chalk.gray("Press Ctrl+C to stop gracefully\n"));
 
-  // Keep process alive
   while (true) {
     await sleep(60_000);
   }
@@ -162,7 +163,7 @@ async function main() {
 main().catch((err) => {
   log.error(`Fatal error at step [${state.step}]: ${err.message}`);
   if (state.step === "funding" || state.step === "lut") {
-    log.warn("Wallets may have been funded. Check wallet vault for recovery.");
+    log.warn("Wallets may have been funded. Run `npm run recover` to reclaim SOL.");
   }
   console.error(err);
   process.exit(1);
