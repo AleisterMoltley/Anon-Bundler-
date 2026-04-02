@@ -1,5 +1,6 @@
 import chalk from "chalk";
 import { Connection, PublicKey, TransactionSignature } from "@solana/web3.js";
+import axios from "axios";
 
 // === Random helpers ===
 
@@ -14,6 +15,34 @@ export function randomDelay(min: number, max: number): number {
 export async function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+// === Rate Limiter (FIX #17) ===
+
+export class RateLimiter {
+  private timestamps: number[] = [];
+
+  constructor(
+    private maxCalls: number,
+    private windowMs: number
+  ) {}
+
+  async wait(): Promise<void> {
+    const now = Date.now();
+    this.timestamps = this.timestamps.filter((t) => now - t < this.windowMs);
+
+    if (this.timestamps.length >= this.maxCalls) {
+      const oldest = this.timestamps[0]!;
+      const waitMs = this.windowMs - (now - oldest) + 100;
+      log.warn(`Rate limit: waiting ${Math.round(waitMs)}ms`);
+      await sleep(waitMs);
+    }
+
+    this.timestamps.push(Date.now());
+  }
+}
+
+// Jupiter: ~600 req/min for free tier, be conservative
+export const jupiterLimiter = new RateLimiter(30, 60_000);
 
 // === Retry with exponential backoff ===
 
@@ -31,7 +60,9 @@ export async function retry<T>(
       lastError = err;
       if (attempt < retries) {
         const delayMs = baseMs * Math.pow(2, attempt) + Math.random() * 500;
-        log.warn(`${label} failed (attempt ${attempt + 1}/${retries + 1}), retrying in ${Math.round(delayMs)}ms...`);
+        log.warn(
+          `${label} failed (attempt ${attempt + 1}/${retries + 1}), retrying in ${Math.round(delayMs)}ms: ${err.message}`
+        );
         await sleep(delayMs);
       }
     }
@@ -50,9 +81,14 @@ export async function confirmTx(
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const status = await connection.getSignatureStatus(sig);
-    if (status?.value?.confirmationStatus === commitment || status?.value?.confirmationStatus === "finalized") {
+    if (
+      status?.value?.confirmationStatus === commitment ||
+      status?.value?.confirmationStatus === "finalized"
+    ) {
       if (status.value.err) {
-        throw new Error(`Transaction ${sig} confirmed with error: ${JSON.stringify(status.value.err)}`);
+        throw new Error(
+          `Transaction ${sig} confirmed with error: ${JSON.stringify(status.value.err)}`
+        );
       }
       return;
     }
@@ -61,7 +97,7 @@ export async function confirmTx(
   throw new Error(`Transaction ${sig} confirmation timed out after ${timeoutMs}ms`);
 }
 
-// === Jito Tip Accounts ===
+// === Jito Tip Accounts (FIX #11: fetch via proper API, not private RPC method) ===
 
 const FALLBACK_TIP_ACCOUNTS = [
   "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
@@ -74,11 +110,13 @@ const FALLBACK_TIP_ACCOUNTS = [
   "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ];
 
-export async function getDynamicTipAccounts(connection: Connection): Promise<PublicKey[]> {
+export async function getDynamicTipAccounts(): Promise<PublicKey[]> {
   try {
-    const resp = await (connection as any)._rpcRequest("getTipAccounts", []);
-    if (resp?.result && Array.isArray(resp.result) && resp.result.length > 0) {
-      return resp.result.map((a: string) => new PublicKey(a));
+    const res = await axios.get("https://mainnet.block-engine.jito.wtf/api/v1/bundles/tip_accounts", {
+      timeout: 5_000,
+    });
+    if (Array.isArray(res.data) && res.data.length > 0) {
+      return res.data.map((a: string) => new PublicKey(a));
     }
   } catch {
     // fallback below

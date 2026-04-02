@@ -5,6 +5,13 @@ import { CONFIG } from "../config";
 
 const PUMP_FUN_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 
+// Pump.fun bonding curve account discriminator (first 8 bytes)
+// This should be verified against the actual program
+const BONDING_CURVE_DISCRIMINATOR = Buffer.from([0x17, 0xb7, 0xf8, 0x37, 0x60, 0xd8, 0xac, 0x60]);
+
+// Expected account data size for bonding curve
+const EXPECTED_MIN_SIZE = 128; // bytes
+
 /**
  * Derive the bonding curve PDA for a given mint
  */
@@ -18,7 +25,10 @@ function getBondingCurveAddress(mint: PublicKey): PublicKey {
 
 /**
  * Check bonding curve progress from onchain data
- * Returns progress as 0-100 percent
+ *
+ * FIX #8: Validate account data structure before reading offsets.
+ * Checks discriminator, minimum data length, and validates the read
+ * value is within a sane range.
  */
 async function checkBondingCurveProgress(
   connection: Connection,
@@ -32,19 +42,35 @@ async function checkBondingCurveProgress(
       return { progress: 0, completed: false };
     }
 
-    // Pump.fun bonding curve account layout:
-    // The curve completes when virtualSolReserves reach the threshold (~85 SOL)
-    // Exact offsets depend on Pump.fun program version
     const data = accountInfo.data;
 
-    // Check if account is still active (not migrated yet)
-    if (data.length < 64) {
-      // Account too small or already closed = likely migrated
+    // Account closed or too small = likely migrated
+    if (data.length < EXPECTED_MIN_SIZE) {
       return { progress: 100, completed: true };
     }
 
-    // Read virtualSolReserves (offset varies, common is at byte 8, u64 LE)
+    // FIX #8: Validate discriminator before reading data
+    const discriminator = data.subarray(0, 8);
+    if (!discriminator.equals(BONDING_CURVE_DISCRIMINATOR)) {
+      log.warn(
+        `Bonding curve discriminator mismatch. Expected ${BONDING_CURVE_DISCRIMINATOR.toString("hex")}, ` +
+          `got ${discriminator.toString("hex")}. Account layout may have changed.`
+      );
+      // Fall back to checking if account still has data (rough heuristic)
+      return { progress: -1, completed: false };
+    }
+
+    // Read virtualSolReserves at offset 8 (u64 LE, after 8-byte discriminator)
     const virtualSolReserves = Number(data.readBigUInt64LE(8)) / 1e9;
+
+    // Sanity check: reserves should be between 0 and 200 SOL
+    if (virtualSolReserves < 0 || virtualSolReserves > 200) {
+      log.warn(
+        `Bonding curve virtualSolReserves out of range: ${virtualSolReserves} SOL. ` +
+          `Account layout may have changed.`
+      );
+      return { progress: -1, completed: false };
+    }
 
     // Pump.fun bonding curve completes around 85 SOL
     const targetSol = 85;
@@ -61,12 +87,8 @@ async function checkBondingCurveProgress(
 /**
  * Check if migration to PumpSwap (Raydium) has already occurred
  */
-async function checkIfMigrated(
-  connection: Connection,
-  mint: PublicKey
-): Promise<boolean> {
+async function checkIfMigrated(connection: Connection, mint: PublicKey): Promise<boolean> {
   try {
-    // Check if there's a Raydium pool for this token (via DexScreener API)
     const res = await axios.get(
       `https://api.dexscreener.com/latest/dex/tokens/${mint.toBase58()}`,
       { timeout: 10_000 }
@@ -85,7 +107,6 @@ async function checkIfMigrated(
 
 /**
  * Start auto-migration monitor
- * Watches bonding curve progress and detects migration to PumpSwap/Raydium
  */
 export function startAutoMigration(
   connection: Connection,
@@ -102,15 +123,14 @@ export function startAutoMigration(
   log.success(`Auto-migration monitor started for ${mint.toBase58().slice(0, 12)}...`);
 
   const loop = async () => {
-    // Initial delay for token to settle
     await sleep(10_000);
 
     while (running) {
       try {
         const { progress, completed } = await checkBondingCurveProgress(connection, mint);
 
-        // Log progress changes
-        if (Math.abs(progress - lastProgress) >= 5) {
+        // Skip logging if we can't read the curve (-1 = unreadable)
+        if (progress >= 0 && Math.abs(progress - lastProgress) >= 5) {
           log.info(`Bonding curve progress: ${progress.toFixed(1)}%`);
           lastProgress = progress;
         }
@@ -118,7 +138,6 @@ export function startAutoMigration(
         if (completed) {
           log.success("Bonding curve completed! Checking migration status...");
 
-          // Check if already migrated
           const migrated = await checkIfMigrated(connection, mint);
 
           if (migrated) {
@@ -128,14 +147,12 @@ export function startAutoMigration(
             break;
           } else {
             log.info("Bonding curve complete but not yet migrated. Pump.fun will auto-migrate.");
-            log.info("Waiting for migration...");
           }
         }
       } catch (err: any) {
         log.warn(`Migration monitor error: ${err.message}`);
       }
 
-      // Poll every 7s during active phase, 30s after completion
       await sleep(lastProgress >= 100 ? 30_000 : 7_000);
     }
   };

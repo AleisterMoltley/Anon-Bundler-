@@ -3,16 +3,33 @@ import {
   Keypair,
   PublicKey,
   LAMPORTS_PER_SOL,
-  TransactionMessage,
   VersionedTransaction,
 } from "@solana/web3.js";
 import axios from "axios";
 import { CONFIG } from "../config";
-import { randomAmount, randomDelay, sleep, log, retry } from "../utils";
+import { randomAmount, randomDelay, sleep, log, jupiterLimiter } from "../utils";
 
 const JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote";
 const JUPITER_SWAP_API = "https://quote-api.jup.ag/v6/swap";
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
+
+/**
+ * Get token balance for a wallet
+ */
+async function getTokenBalance(
+  connection: Connection,
+  wallet: PublicKey,
+  mint: PublicKey
+): Promise<bigint> {
+  try {
+    const accounts = await connection.getTokenAccountsByOwner(wallet, { mint });
+    if (accounts.value.length === 0) return BigInt(0);
+    const info = await connection.getTokenAccountBalance(accounts.value[0]!.pubkey);
+    return BigInt(info.value.amount);
+  } catch {
+    return BigInt(0);
+  }
+}
 
 /**
  * Execute a single buy via Jupiter
@@ -24,9 +41,10 @@ async function executeBuy(
   solAmount: number
 ): Promise<string | null> {
   try {
+    await jupiterLimiter.wait();
+
     const lamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
 
-    // Get Jupiter quote
     const quoteRes = await axios.get(JUPITER_QUOTE_API, {
       params: {
         inputMint: WSOL_MINT,
@@ -42,7 +60,8 @@ async function executeBuy(
       return null;
     }
 
-    // Get swap transaction
+    await jupiterLimiter.wait();
+
     const swapRes = await axios.post(
       JUPITER_SWAP_API,
       {
@@ -64,7 +83,9 @@ async function executeBuy(
       maxRetries: 2,
     });
 
-    log.info(`Volume buy: ${solAmount} SOL from ${wallet.publicKey.toBase58().slice(0, 8)}... (sig: ${sig.slice(0, 16)}...)`);
+    log.info(
+      `Volume buy: ${solAmount} SOL from ${wallet.publicKey.toBase58().slice(0, 8)}... (sig: ${sig.slice(0, 16)}...)`
+    );
     return sig;
   } catch (err: any) {
     log.warn(`Volume buy failed: ${err.message}`);
@@ -74,25 +95,42 @@ async function executeBuy(
 
 /**
  * Execute a single sell via Jupiter
+ *
+ * FIX #9: Sell a percentage of actual token balance instead of
+ * using SOL amount * 1e9 (which was completely wrong)
  */
 async function executeSell(
   connection: Connection,
   wallet: Keypair,
   mint: PublicKey,
-  tokenAmount: number
+  sellPercent: number = 10
 ): Promise<string | null> {
   try {
+    // Get actual token balance
+    const balance = await getTokenBalance(connection, wallet.publicKey, mint);
+    if (balance === BigInt(0)) {
+      return null; // nothing to sell
+    }
+
+    // Sell a percentage of holdings
+    const sellAmount = (balance * BigInt(sellPercent)) / BigInt(100);
+    if (sellAmount === BigInt(0)) return null;
+
+    await jupiterLimiter.wait();
+
     const quoteRes = await axios.get(JUPITER_QUOTE_API, {
       params: {
         inputMint: mint.toBase58(),
         outputMint: WSOL_MINT,
-        amount: tokenAmount,
+        amount: sellAmount.toString(),
         slippageBps: CONFIG.slippageBps,
       },
       timeout: 10_000,
     });
 
     if (!quoteRes.data) return null;
+
+    await jupiterLimiter.wait();
 
     const swapRes = await axios.post(
       JUPITER_SWAP_API,
@@ -115,7 +153,9 @@ async function executeSell(
       maxRetries: 2,
     });
 
-    log.info(`Volume sell from ${wallet.publicKey.toBase58().slice(0, 8)}... (sig: ${sig.slice(0, 16)}...)`);
+    log.info(
+      `Volume sell: ${sellPercent}% from ${wallet.publicKey.toBase58().slice(0, 8)}... (sig: ${sig.slice(0, 16)}...)`
+    );
     return sig;
   } catch (err: any) {
     log.warn(`Volume sell failed: ${err.message}`);
@@ -150,8 +190,7 @@ export function startVolumeBot(
   const loop = async () => {
     while (running) {
       try {
-        // Round-robin through wallets
-        const wallet = wallets[walletIndex % wallets.length];
+        const wallet = wallets[walletIndex % wallets.length]!;
         walletIndex++;
 
         const amount = randomAmount(0.005, 0.09);
@@ -165,8 +204,8 @@ export function startVolumeBot(
         if (Math.random() < 0.7) {
           await executeBuy(connection, wallet, mint, amount);
         } else {
-          // Sell a small token amount
-          await executeSell(connection, wallet, mint, Math.floor(amount * 1e9));
+          // FIX #9: Sell 5-15% of actual token balance
+          await executeSell(connection, wallet, mint, randomAmount(5, 15));
         }
       } catch (err: any) {
         log.warn(`Volume bot cycle error: ${err.message}`);

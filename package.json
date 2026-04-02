@@ -1,10 +1,11 @@
 {
   "name": "solana-max-bundler",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "scripts": {
     "start": "ts-node src/index.ts",
     "build": "tsc",
-    "start:built": "node dist/index.js"
+    "start:built": "node dist/index.js",
+    "recover": "ts-node src/recover.ts"
   },
   "dependencies": {
     "@solana/web3.js": "^1.95.0",

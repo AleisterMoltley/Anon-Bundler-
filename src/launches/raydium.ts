@@ -20,6 +20,13 @@ import {
 
 const WSOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
 
+/**
+ * Launch on Raydium V2 CPMM
+ *
+ * NOTE: Raydium mode does NOT support atomic bundle buys because the pool
+ * must be confirmed onchain before swap TXs can be built. Buyer wallets
+ * are used by the post-launch volume bot instead.
+ */
 export async function launchOnRaydium(
   creator: Keypair,
   connection: Connection,
@@ -93,10 +100,6 @@ export async function launchOnRaydium(
   log.success(`Raydium CPMM Pool created! TX: ${txId}`);
   log.success(`Pool: ${extInfo.poolId.toBase58()}`);
 
-  // 5. Build buyer swap transactions for Jito bundle
-  // NOTE: Raydium swap TXs would need the pool to be confirmed first,
-  // so for Raydium mode we return the mint and empty bundle TXs.
-  // Buyer buys happen post-launch via volume bot.
   log.info(`${buyerWallets.length} buyer wallets available for post-launch volume`);
 
   return { mint: baseMint, transactions: [] };

@@ -1,12 +1,12 @@
 import {
   Connection,
   Keypair,
-  PublicKey,
   SystemProgram,
   TransactionMessage,
   VersionedTransaction,
   LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
+import bs58 from "bs58";
 import axios from "axios";
 import { CONFIG } from "./config";
 import { getDynamicTipAccounts, log, retry, sleep } from "./utils";
@@ -16,6 +16,8 @@ const JITO_BLOCK_ENGINES = [
   "https://ny.block-engine.jito.wtf",
 ];
 
+const JITO_MAX_BUNDLE_SIZE = 5;
+
 /**
  * Build a tip transaction for Jito validators
  */
@@ -24,8 +26,8 @@ async function buildTipTransaction(
   payer: Keypair,
   tipLamports: number
 ): Promise<VersionedTransaction> {
-  const tipAccounts = await getDynamicTipAccounts(connection);
-  const tipAccount = tipAccounts[Math.floor(Math.random() * tipAccounts.length)];
+  const tipAccounts = await getDynamicTipAccounts();
+  const tipAccount = tipAccounts[Math.floor(Math.random() * tipAccounts.length)]!;
 
   const blockhash = await connection.getLatestBlockhash("confirmed");
 
@@ -44,13 +46,17 @@ async function buildTipTransaction(
   const tx = new VersionedTransaction(message);
   tx.sign([payer]);
 
-  log.info(`Tip TX built: ${tipLamports / LAMPORTS_PER_SOL} SOL → ${tipAccount.toBase58().slice(0, 12)}...`);
+  log.info(
+    `Tip TX built: ${tipLamports / LAMPORTS_PER_SOL} SOL → ${tipAccount.toBase58().slice(0, 12)}...`
+  );
   return tx;
 }
 
 /**
  * Send a Jito bundle via block engine API
- * K2 + K3 fix: Actually sends transactions, dual submission
+ *
+ * FIX #1: Use base58 encoding (not base64) — Jito API expects base58
+ * FIX #3: Reserve 1 slot for tip TX, trim payload TXs first
  */
 export async function sendJitoBundle(
   connection: Connection,
@@ -68,21 +74,25 @@ export async function sendJitoBundle(
     return "dry-run-bundle-id";
   }
 
+  // FIX #3: Trim payload transactions FIRST, reserve 1 slot for tip
+  const maxPayloadTxs = JITO_MAX_BUNDLE_SIZE - 1; // 4
+  if (transactions.length > maxPayloadTxs) {
+    log.warn(
+      `Payload has ${transactions.length} transactions (max ${maxPayloadTxs} + 1 tip). Trimming to ${maxPayloadTxs}.`
+    );
+    transactions = transactions.slice(0, maxPayloadTxs);
+  }
+
   // Append tip transaction as last TX in bundle
   const tipTx = await buildTipTransaction(connection, payer, tipLamports);
   const bundle = [...transactions, tipTx];
 
-  if (bundle.length > 5) {
-    log.warn(`Bundle has ${bundle.length} transactions (Jito max is 5). Trimming to 5.`);
-    bundle.splice(5);
-  }
+  // FIX #1: Serialize to base58 for Jito API (not base64!)
+  const encodedTxs = bundle.map((tx) => bs58.encode(Buffer.from(tx.serialize())));
 
-  // Serialize to base58 for Jito API
-  const encodedTxs = bundle.map((tx) =>
-    Buffer.from(tx.serialize()).toString("base64")
+  log.step(
+    `Sending Jito bundle (${bundle.length} txs: ${transactions.length} payload + 1 tip, tip: ${tipLamports / LAMPORTS_PER_SOL} SOL)...`
   );
-
-  log.step(`Sending Jito bundle (${bundle.length} txs, tip: ${tipLamports / LAMPORTS_PER_SOL} SOL)...`);
 
   // Dual submission to multiple block engines
   const results = await Promise.allSettled(
@@ -111,7 +121,6 @@ export async function sendJitoBundle(
     )
   );
 
-  // Check results
   for (const result of results) {
     if (result.status === "fulfilled" && result.value) {
       log.success(`Jito bundle accepted! Bundle ID: ${result.value}`);
@@ -119,7 +128,6 @@ export async function sendJitoBundle(
     }
   }
 
-  // All engines failed
   const errors = results
     .filter((r): r is PromiseRejectedResult => r.status === "rejected")
     .map((r) => r.reason?.message || "unknown");
@@ -152,7 +160,10 @@ export async function waitForBundleConfirmation(
       const statuses = res.data?.result?.value;
       if (statuses && statuses.length > 0) {
         const status = statuses[0];
-        if (status.confirmation_status === "confirmed" || status.confirmation_status === "finalized") {
+        if (
+          status.confirmation_status === "confirmed" ||
+          status.confirmation_status === "finalized"
+        ) {
           log.success(`Bundle ${bundleId} confirmed onchain!`);
           return true;
         }

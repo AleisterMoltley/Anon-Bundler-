@@ -17,7 +17,6 @@ export async function uploadMetadata(
 ): Promise<string> {
   const metadata: TokenMetadata = { name, symbol, description, image: imageUrl };
 
-  // Real Pinata upload if JWT is provided
   if (CONFIG.pinataJwt) {
     return retry(
       async () => {
@@ -49,9 +48,8 @@ export async function uploadMetadata(
     );
   }
 
-  // No Pinata JWT — abort, don't use fake URI
   throw new Error(
     "PINATA_JWT is not set. Cannot upload metadata. " +
-    "Set PINATA_JWT in .env or provide a pre-uploaded metadata URI."
+      "Set PINATA_JWT in .env or provide a pre-uploaded metadata URI."
   );
 }
