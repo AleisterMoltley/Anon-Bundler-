@@ -21,9 +21,18 @@ function intEnv(key: string, fallback: number, min?: number, max?: number): numb
   return val;
 }
 
-function floatEnv(key: string, fallback: number): number {
+function floatEnv(key: string, fallback: number, min?: number, max?: number): number {
   const val = parseFloat(process.env[key] || String(fallback));
-  return isNaN(val) ? fallback : val;
+  if (isNaN(val)) return fallback;
+  if (min !== undefined && val < min) return min;
+  if (max !== undefined && val > max) return max;
+  return val;
+}
+
+function boolEnv(key: string, fallback: boolean): boolean {
+  const raw = (process.env[key] || "").trim().toLowerCase();
+  if (raw === "") return fallback;
+  return raw === "true" || raw === "1" || raw === "yes";
 }
 
 export const CONFIG = {
@@ -42,51 +51,61 @@ export const CONFIG = {
 
   // Wallet config
   numWallets: intEnv("NUM_WALLETS", 20, 1, 300),
-  solPerWallet: floatEnv("SOL_PER_WALLET", 0.28),
+  solPerWallet: floatEnv("SOL_PER_WALLET", 0.28, 0.02),
 
-  // FIX #3/#14: Max 3 bundle wallets (create TX + 3 buyers + tip = 5 Jito max)
+  // Max 3 bundle wallets (create TX + 3 buyers + tip = 5 Jito max)
   bundleWalletsCount: intEnv("BUNDLE_WALLETS_COUNT", 3, 1, 3),
 
-  jitoTipLamports: intEnv("JITO_TIP_LAMPORTS", 950_000, 100_000, 10_000_000),
+  // Jito tip config (dynamic via tip_floor, fallback to static)
+  jitoTipLamportsFallback: intEnv("JITO_TIP_LAMPORTS", 1_000_000, 1_000, 50_000_000),
+  jitoTipMultiplier: floatEnv("JITO_TIP_MULTIPLIER", 1.5, 1.0, 10.0),
+  jitoTipPercentile: optionalEnv("JITO_TIP_PERCENTILE", "75") as "25" | "50" | "75" | "95" | "99",
+  jitoTipMaxLamports: intEnv("JITO_TIP_MAX_LAMPORTS", 5_000_000, 10_000, 100_000_000),
+
   vanityPrefix: optionalEnv("VANITY_PREFIX", ""),
   vanityTimeoutSec: intEnv("VANITY_TIMEOUT_SEC", 30, 5, 300),
 
-  // Slippage — capped at 10% max
+  // Slippage as BPS (50-1000 bps = 0.5%-10%)
   slippageBps: intEnv("SLIPPAGE_BPS", 500, 50, 1000),
 
-  // FIX #13: Creator buy amount configurable
-  creatorBuySol: floatEnv("CREATOR_BUY_SOL", 0.5),
+  // Creator + bundle buy amounts
+  creatorBuySol: floatEnv("CREATOR_BUY_SOL", 0.5, 0.001),
+  bundleBuyMinSol: floatEnv("BUNDLE_BUY_MIN_SOL", 0.09, 0.001),
+  bundleBuyMaxSol: floatEnv("BUNDLE_BUY_MAX_SOL", 0.48, 0.001),
 
   // Post-launch
-  autoMigrate: process.env.AUTO_MIGRATE !== "false",
-  volumeEnabled: process.env.VOLUME_BOT_ENABLED !== "false",
-  volumeBuysPerMin: intEnv("VOLUME_BUYS_PER_MIN", 12, 1, 30), // FIX #17: Cap at 30 to avoid rate limits
+  autoMigrate: boolEnv("AUTO_MIGRATE", true),
+  volumeEnabled: boolEnv("VOLUME_BOT_ENABLED", true),
+  volumeBuysPerMin: intEnv("VOLUME_BUYS_PER_MIN", 12, 1, 30),
   autoSellPercent: intEnv("AUTO_SELL_PERCENT", 35, 5, 95),
 
   // Metadata
   pinataJwt: optionalEnv("PINATA_JWT", ""),
 
+  // Jupiter (optional API key unlocks higher rate limits on Pro tier)
+  jupiterApiKey: optionalEnv("JUPITER_API_KEY", ""),
+
   // Security
   walletVaultPassword: optionalEnv("WALLET_VAULT_PASSWORD", ""),
-  dryRun: process.env.DRY_RUN === "true",
+  dryRun: boolEnv("DRY_RUN", false),
 };
 
 export function validateConfig() {
   if (CONFIG.masterPrivateKey.length < 40) {
-    throw new Error("MASTER_PRIVATE_KEY looks invalid (too short)");
+    throw new Error("MASTER_PRIVATE_KEY looks invalid (too short, expected base58)");
   }
   if (!CONFIG.rpcUrl.startsWith("https://")) {
     throw new Error("RPC_URL must use HTTPS");
   }
-
-  // FIX #4: Require vault password for real launches
+  if (CONFIG.bundleBuyMinSol > CONFIG.bundleBuyMaxSol) {
+    throw new Error("BUNDLE_BUY_MIN_SOL must be <= BUNDLE_BUY_MAX_SOL");
+  }
   if (!CONFIG.dryRun && !CONFIG.walletVaultPassword) {
     throw new Error(
       "WALLET_VAULT_PASSWORD is required for non-dry-run launches. " +
         "Generated wallet private keys will be written to disk — set a password to encrypt them."
     );
   }
-
   if (CONFIG.dryRun) {
     console.log("⚠️  DRY_RUN mode active — no transactions will be sent onchain");
   }

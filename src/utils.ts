@@ -1,6 +1,22 @@
 import chalk from "chalk";
-import { Connection, PublicKey, TransactionSignature } from "@solana/web3.js";
+import {
+  Connection,
+  PublicKey,
+  TransactionSignature,
+  BlockhashWithExpiryBlockHeight,
+} from "@solana/web3.js";
 import axios from "axios";
+import { CONFIG } from "./config";
+
+// === Jupiter API endpoints (lite-api.jup.ag is the current public endpoint) ===
+export const JUPITER_QUOTE_API = "https://lite-api.jup.ag/swap/v1/quote";
+export const JUPITER_SWAP_API = "https://lite-api.jup.ag/swap/v1/swap";
+export const JUPITER_PRICE_API = "https://lite-api.jup.ag/price/v3";
+export const WSOL_MINT = "So11111111111111111111111111111111111111112";
+
+export function jupiterHeaders(): Record<string, string> {
+  return CONFIG.jupiterApiKey ? { "x-api-key": CONFIG.jupiterApiKey } : {};
+}
 
 // === Random helpers ===
 
@@ -16,7 +32,7 @@ export async function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// === Rate Limiter (FIX #17) ===
+// === Rate Limiter ===
 
 export class RateLimiter {
   private timestamps: number[] = [];
@@ -41,7 +57,7 @@ export class RateLimiter {
   }
 }
 
-// Jupiter: ~600 req/min for free tier, be conservative
+// Jupiter free tier: ~60 req/min. Be conservative at 30/min.
 export const jupiterLimiter = new RateLimiter(30, 60_000);
 
 // === Retry with exponential backoff ===
@@ -70,34 +86,29 @@ export async function retry<T>(
   throw lastError;
 }
 
-// === TX Confirmation with timeout ===
+// === TX Confirmation using blockhash expiry (far more robust than naive polling) ===
 
 export async function confirmTx(
   connection: Connection,
   sig: TransactionSignature,
-  commitment: "confirmed" | "finalized" = "confirmed",
-  timeoutMs: number = 30_000
+  blockhashInfo: BlockhashWithExpiryBlockHeight,
+  commitment: "confirmed" | "finalized" = "confirmed"
 ): Promise<void> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const status = await connection.getSignatureStatus(sig);
-    if (
-      status?.value?.confirmationStatus === commitment ||
-      status?.value?.confirmationStatus === "finalized"
-    ) {
-      if (status.value.err) {
-        throw new Error(
-          `Transaction ${sig} confirmed with error: ${JSON.stringify(status.value.err)}`
-        );
-      }
-      return;
-    }
-    await sleep(1500);
+  const res = await connection.confirmTransaction(
+    {
+      signature: sig,
+      blockhash: blockhashInfo.blockhash,
+      lastValidBlockHeight: blockhashInfo.lastValidBlockHeight,
+    },
+    commitment
+  );
+
+  if (res.value.err) {
+    throw new Error(`Transaction ${sig} failed onchain: ${JSON.stringify(res.value.err)}`);
   }
-  throw new Error(`Transaction ${sig} confirmation timed out after ${timeoutMs}ms`);
 }
 
-// === Jito Tip Accounts (FIX #11: fetch via proper API, not private RPC method) ===
+// === Jito Tip Accounts (static fallback list — identical across block engines) ===
 
 const FALLBACK_TIP_ACCOUNTS = [
   "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
@@ -110,18 +121,71 @@ const FALLBACK_TIP_ACCOUNTS = [
   "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ];
 
+let cachedTipAccounts: PublicKey[] | null = null;
+
 export async function getDynamicTipAccounts(): Promise<PublicKey[]> {
+  if (cachedTipAccounts) return cachedTipAccounts;
   try {
-    const res = await axios.get("https://mainnet.block-engine.jito.wtf/api/v1/bundles/tip_accounts", {
-      timeout: 5_000,
-    });
+    const res = await axios.get(
+      "https://mainnet.block-engine.jito.wtf/api/v1/bundles/tip_accounts",
+      { timeout: 5_000 }
+    );
+    if (Array.isArray(res.data?.result) && res.data.result.length > 0) {
+      cachedTipAccounts = res.data.result.map((a: string) => new PublicKey(a));
+      return cachedTipAccounts!;
+    }
     if (Array.isArray(res.data) && res.data.length > 0) {
-      return res.data.map((a: string) => new PublicKey(a));
+      cachedTipAccounts = res.data.map((a: string) => new PublicKey(a));
+      return cachedTipAccounts!;
     }
   } catch {
-    // fallback below
+    // fallback
   }
-  return FALLBACK_TIP_ACCOUNTS.map((a) => new PublicKey(a));
+  cachedTipAccounts = FALLBACK_TIP_ACCOUNTS.map((a) => new PublicKey(a));
+  return cachedTipAccounts;
+}
+
+// === Jito tip_floor (dynamic tip sizing based on recent landed bundles) ===
+
+interface TipFloorResponse {
+  time: string;
+  landed_tips_25th_percentile: number;
+  landed_tips_50th_percentile: number;
+  landed_tips_75th_percentile: number;
+  landed_tips_95th_percentile: number;
+  landed_tips_99th_percentile: number;
+  ema_landed_tips_50th_percentile: number;
+}
+
+/**
+ * Returns tip in lamports based on recent landed-bundle percentile × multiplier,
+ * capped by JITO_TIP_MAX_LAMPORTS. Falls back to JITO_TIP_LAMPORTS if API fails.
+ */
+export async function getDynamicTipLamports(): Promise<number> {
+  const pctKey = `landed_tips_${CONFIG.jitoTipPercentile}th_percentile` as keyof TipFloorResponse;
+
+  try {
+    const res = await axios.get("https://bundles.jito.wtf/api/v1/bundles/tip_floor", {
+      timeout: 5_000,
+    });
+    const data: TipFloorResponse | undefined = Array.isArray(res.data) ? res.data[0] : undefined;
+    const solTip = data?.[pctKey];
+
+    if (typeof solTip === "number" && solTip > 0) {
+      const scaled = Math.floor(solTip * 1e9 * CONFIG.jitoTipMultiplier);
+      const tip = Math.min(
+        Math.max(scaled, CONFIG.jitoTipLamportsFallback),
+        CONFIG.jitoTipMaxLamports
+      );
+      log.info(
+        `Jito tip: p${CONFIG.jitoTipPercentile}=${(solTip * 1e9).toFixed(0)} lamports × ${CONFIG.jitoTipMultiplier} → ${tip} lamports (${(tip / 1e9).toFixed(6)} SOL)`
+      );
+      return tip;
+    }
+  } catch (err: any) {
+    log.warn(`Jito tip_floor fetch failed: ${err.message} — using fallback`);
+  }
+  return CONFIG.jitoTipLamportsFallback;
 }
 
 // === Logging ===

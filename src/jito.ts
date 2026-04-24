@@ -5,36 +5,38 @@ import {
   TransactionMessage,
   VersionedTransaction,
   LAMPORTS_PER_SOL,
+  BlockhashWithExpiryBlockHeight,
 } from "@solana/web3.js";
 import bs58 from "bs58";
 import axios from "axios";
 import crypto from "crypto";
 import { CONFIG } from "./config";
-import { getDynamicTipAccounts, log, retry, sleep } from "./utils";
+import { getDynamicTipAccounts, getDynamicTipLamports, log, retry, sleep } from "./utils";
 
+// Frankfurt + NY + mainnet global — user is in Frankfurt, so FRA is lowest latency
 const JITO_BLOCK_ENGINES = [
+  "https://frankfurt.mainnet.block-engine.jito.wtf",
+  "https://ny.mainnet.block-engine.jito.wtf",
   "https://mainnet.block-engine.jito.wtf",
-  "https://ny.block-engine.jito.wtf",
 ];
 
 const JITO_MAX_BUNDLE_SIZE = 5;
 
 /**
- * Build a tip transaction for Jito validators
+ * Build a tip transaction that transfers SOL to a random Jito tip account.
+ * Must share the bundle's blockhash so all TXs land in the same slot.
  */
 async function buildTipTransaction(
-  connection: Connection,
   payer: Keypair,
-  tipLamports: number
+  tipLamports: number,
+  blockhashInfo: BlockhashWithExpiryBlockHeight
 ): Promise<VersionedTransaction> {
   const tipAccounts = await getDynamicTipAccounts();
   const tipAccount = tipAccounts[crypto.randomInt(tipAccounts.length)]!;
 
-  const blockhash = await connection.getLatestBlockhash("confirmed");
-
   const message = new TransactionMessage({
     payerKey: payer.publicKey,
-    recentBlockhash: blockhash.blockhash,
+    recentBlockhash: blockhashInfo.blockhash,
     instructions: [
       SystemProgram.transfer({
         fromPubkey: payer.publicKey,
@@ -48,22 +50,19 @@ async function buildTipTransaction(
   tx.sign([payer]);
 
   log.info(
-    `Tip TX built: ${tipLamports / LAMPORTS_PER_SOL} SOL → ${tipAccount.toBase58().slice(0, 12)}...`
+    `Tip TX: ${(tipLamports / LAMPORTS_PER_SOL).toFixed(6)} SOL → ${tipAccount.toBase58().slice(0, 12)}...`
   );
   return tx;
 }
 
 /**
- * Send a Jito bundle via block engine API
- *
- * FIX #1: Use base58 encoding (not base64) — Jito API expects base58
- * FIX #3: Reserve 1 slot for tip TX, trim payload TXs first
+ * Submit a Jito bundle. Bundle layout: [...payload, tipTx] (max 5 total).
+ * Base58-encoded per Jito API requirement.
  */
 export async function sendJitoBundle(
-  connection: Connection,
   transactions: VersionedTransaction[],
-  tipLamports: number,
-  payer: Keypair
+  payer: Keypair,
+  blockhashInfo: BlockhashWithExpiryBlockHeight
 ): Promise<string | null> {
   if (transactions.length === 0) {
     log.warn("No transactions to bundle — skipping Jito bundle");
@@ -75,27 +74,25 @@ export async function sendJitoBundle(
     return "dry-run-bundle-id";
   }
 
-  // FIX #3: Trim payload transactions FIRST, reserve 1 slot for tip
-  const maxPayloadTxs = JITO_MAX_BUNDLE_SIZE - 1; // 4
+  // Reserve one slot for tip
+  const maxPayloadTxs = JITO_MAX_BUNDLE_SIZE - 1;
   if (transactions.length > maxPayloadTxs) {
     log.warn(
-      `Payload has ${transactions.length} transactions (max ${maxPayloadTxs} + 1 tip). Trimming to ${maxPayloadTxs}.`
+      `Payload has ${transactions.length} TXs (max ${maxPayloadTxs} + 1 tip). Trimming to ${maxPayloadTxs}.`
     );
     transactions = transactions.slice(0, maxPayloadTxs);
   }
 
-  // Append tip transaction as last TX in bundle
-  const tipTx = await buildTipTransaction(connection, payer, tipLamports);
-  const bundle = [...transactions, tipTx];
+  const tipLamports = await getDynamicTipLamports();
+  const tipTx = await buildTipTransaction(payer, tipLamports, blockhashInfo);
 
-  // FIX #1: Serialize to base58 for Jito API (not base64!)
+  const bundle = [...transactions, tipTx];
   const encodedTxs = bundle.map((tx) => bs58.encode(Buffer.from(tx.serialize())));
 
   log.step(
-    `Sending Jito bundle (${bundle.length} txs: ${transactions.length} payload + 1 tip, tip: ${tipLamports / LAMPORTS_PER_SOL} SOL)...`
+    `Sending Jito bundle (${bundle.length} txs: ${transactions.length} payload + 1 tip) to ${JITO_BLOCK_ENGINES.length} engines...`
   );
 
-  // Dual submission to multiple block engines
   const results = await Promise.allSettled(
     JITO_BLOCK_ENGINES.map((engine) =>
       retry(
@@ -110,11 +107,9 @@ export async function sendJitoBundle(
             },
             { timeout: 10_000 }
           );
-
           if (res.data.error) {
             throw new Error(`Jito error: ${JSON.stringify(res.data.error)}`);
           }
-
           return res.data.result as string;
         },
         { retries: 1, label: `Jito ${engine}` }
@@ -122,6 +117,8 @@ export async function sendJitoBundle(
     )
   );
 
+  // Return the first accepted bundle ID (all engines should return the same ID
+  // for the same bundle content, but use the first success).
   for (const result of results) {
     if (result.status === "fulfilled" && result.value) {
       log.success(`Jito bundle accepted! Bundle ID: ${result.value}`);
@@ -137,7 +134,8 @@ export async function sendJitoBundle(
 }
 
 /**
- * Poll for bundle status
+ * Poll bundle status across all engines. Returns true when confirmed/finalized,
+ * false on explicit failure or timeout.
  */
 export async function waitForBundleConfirmation(
   bundleId: string,
@@ -146,35 +144,37 @@ export async function waitForBundleConfirmation(
   const start = Date.now();
 
   while (Date.now() - start < timeoutMs) {
-    try {
-      const res = await axios.post(
-        `${JITO_BLOCK_ENGINES[0]}/api/v1/bundles`,
-        {
-          jsonrpc: "2.0",
-          id: 1,
-          method: "getBundleStatuses",
-          params: [[bundleId]],
-        },
-        { timeout: 5_000 }
-      );
+    for (const engine of JITO_BLOCK_ENGINES) {
+      try {
+        const res = await axios.post(
+          `${engine}/api/v1/bundles`,
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getBundleStatuses",
+            params: [[bundleId]],
+          },
+          { timeout: 5_000 }
+        );
 
-      const statuses = res.data?.result?.value;
-      if (statuses && statuses.length > 0) {
-        const status = statuses[0];
-        if (
-          status.confirmation_status === "confirmed" ||
-          status.confirmation_status === "finalized"
-        ) {
-          log.success(`Bundle ${bundleId} confirmed onchain!`);
-          return true;
+        const statuses = res.data?.result?.value;
+        if (statuses && statuses.length > 0 && statuses[0]) {
+          const status = statuses[0];
+          if (
+            status.confirmation_status === "confirmed" ||
+            status.confirmation_status === "finalized"
+          ) {
+            log.success(`Bundle ${bundleId} confirmed onchain (via ${engine})`);
+            return true;
+          }
+          if (status.err && status.err !== null && typeof status.err === "object") {
+            log.error(`Bundle ${bundleId} failed: ${JSON.stringify(status.err)}`);
+            return false;
+          }
         }
-        if (status.err) {
-          log.error(`Bundle ${bundleId} failed: ${JSON.stringify(status.err)}`);
-          return false;
-        }
+      } catch {
+        // try next engine
       }
-    } catch {
-      // ignore polling errors
     }
 
     await sleep(2000);
