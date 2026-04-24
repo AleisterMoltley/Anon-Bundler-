@@ -4,196 +4,100 @@ import {
   Connection,
   TransactionMessage,
   VersionedTransaction,
-  SystemProgram,
-  LAMPORTS_PER_SOL,
-  TransactionInstruction,
+  ComputeBudgetProgram,
+  AccountInfo,
+  BlockhashWithExpiryBlockHeight,
 } from "@solana/web3.js";
 import {
-  getAssociatedTokenAddressSync,
-  createAssociatedTokenAccountInstruction,
-  TOKEN_PROGRAM_ID,
-  ASSOCIATED_TOKEN_PROGRAM_ID,
-} from "@solana/spl-token";
+  PumpSdk,
+  OnlinePumpSdk,
+  pumpIdl,
+  newBondingCurve,
+  getBuyTokenAmountFromSolAmount,
+  type Global,
+  type FeeConfig,
+  type BondingCurve,
+  PUMP_PROGRAM_ID,
+} from "@pump-fun/pump-sdk";
+import { BorshCoder, BN } from "@coral-xyz/anchor";
+import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { CONFIG } from "../config";
 import { uploadMetadata } from "../metadata";
 import { randomAmount, log } from "../utils";
 
-// === Pump.fun Program Constants ===
-const PUMP_FUN_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
-const PUMP_FUN_TOKEN_MINT_AUTHORITY = new PublicKey("TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM");
-const PUMP_GLOBAL = new PublicKey("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
-const PUMP_FEE_RECIPIENT = new PublicKey("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbCJ2ESTxMwHri");
-const PUMP_EVENT_AUTHORITY = new PublicKey("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1");
-const SYSTEM_PROGRAM = SystemProgram.programId;
-const RENT_PROGRAM = new PublicKey("SysvarRent111111111111111111111111111111111");
-const METAPLEX_PROGRAM = new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
-
-// === Pump.fun Bonding Curve Constants ===
-// Initial virtual reserves at token creation
-const INITIAL_VIRTUAL_TOKEN_RESERVES = BigInt(1_073_000_000_000_000); // ~1.073B tokens (with 6 decimals)
-const INITIAL_VIRTUAL_SOL_RESERVES = BigInt(30_000_000_000); // 30 SOL in lamports
+/**
+ * Constant-product simulation of a Pump.fun bonding curve buy.
+ * Mirrors the on-chain math so bundle buys can predict the min-tokens slippage
+ * bound while all buys are queued atomically in the same Jito bundle.
+ */
+function simulateBuy(
+  vsr: BN,
+  vtr: BN,
+  solInLamports: BN
+): { tokensOut: BN; newVsr: BN; newVtr: BN } {
+  // tokens_out = (vtr * sol_in) / (vsr + sol_in)
+  const tokensOut = vtr.mul(solInLamports).div(vsr.add(solInLamports));
+  const newVsr = vsr.add(solInLamports);
+  const newVtr = vtr.sub(tokensOut);
+  return { tokensOut, newVsr, newVtr };
+}
 
 /**
- * Calculate expected token output from bonding curve using constant product formula
- * tokens_out = (virtual_token_reserves * sol_in) / (virtual_sol_reserves + sol_in)
+ * Encode a BondingCurve state into an AccountInfo<Buffer> that the SDK's
+ * buyInstructions() can consume. Used for bundle buys where the real on-chain
+ * account doesn't exist yet but will by the time the bundle lands.
  *
- * FIX #2: Actually calculate token amount instead of passing 0
+ * The SDK uses `bondingCurve` (decoded) for math and `bondingCurveAccountInfo`
+ * only for the initialization branch check (data length / discriminator).
  */
-function calculateTokensOut(
-  solAmountLamports: bigint,
-  virtualSolReserves: bigint,
-  virtualTokenReserves: bigint
-): bigint {
-  const numerator = virtualTokenReserves * solAmountLamports;
-  const denominator = virtualSolReserves + solAmountLamports;
-  return numerator / denominator;
+function encodeBondingCurveAccountInfo(
+  bc: BondingCurve,
+  coder: BorshCoder
+): Promise<AccountInfo<Buffer>> {
+  return coder.accounts
+    .encode("BondingCurve", {
+      virtual_token_reserves: bc.virtualTokenReserves,
+      virtual_sol_reserves: bc.virtualSolReserves,
+      real_token_reserves: bc.realTokenReserves,
+      real_sol_reserves: bc.realSolReserves,
+      token_total_supply: bc.tokenTotalSupply,
+      complete: bc.complete,
+      creator: bc.creator,
+      is_mayhem_mode: bc.isMayhemMode,
+      is_cashback_coin: bc.isCashbackCoin,
+    })
+    .then((data) => ({
+      data,
+      owner: PUMP_PROGRAM_ID,
+      executable: false,
+      lamports: 0,
+      rentEpoch: 0,
+    }));
 }
 
 /**
- * Calculate expected tokens for a buy on a fresh bonding curve (first buy)
- */
-function calculateInitialBuyTokens(solAmountLamports: bigint): bigint {
-  return calculateTokensOut(solAmountLamports, INITIAL_VIRTUAL_SOL_RESERVES, INITIAL_VIRTUAL_TOKEN_RESERVES);
-}
-
-/**
- * Build the Pump.fun create token instruction
- */
-function buildPumpCreateInstruction(
-  creator: PublicKey,
-  mint: PublicKey,
-  name: string,
-  symbol: string,
-  metadataUri: string
-): TransactionInstruction {
-  const [bondingCurve] = PublicKey.findProgramAddressSync(
-    [Buffer.from("bonding-curve"), mint.toBuffer()],
-    PUMP_FUN_PROGRAM
-  );
-  const bondingCurveAta = getAssociatedTokenAddressSync(mint, bondingCurve, true);
-
-  const [metadataPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("metadata"), METAPLEX_PROGRAM.toBuffer(), mint.toBuffer()],
-    METAPLEX_PROGRAM
-  );
-
-  // Encode instruction data: discriminator + name + symbol + uri
-  const nameBuffer = Buffer.from(name, "utf8");
-  const symbolBuffer = Buffer.from(symbol, "utf8");
-  const uriBuffer = Buffer.from(metadataUri, "utf8");
-
-  const discriminator = Buffer.from([0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77]);
-
-  const data = Buffer.concat([
-    discriminator,
-    Buffer.from(new Uint32Array([nameBuffer.length]).buffer),
-    nameBuffer,
-    Buffer.from(new Uint32Array([symbolBuffer.length]).buffer),
-    symbolBuffer,
-    Buffer.from(new Uint32Array([uriBuffer.length]).buffer),
-    uriBuffer,
-  ]);
-
-  return new TransactionInstruction({
-    programId: PUMP_FUN_PROGRAM,
-    keys: [
-      { pubkey: mint, isSigner: true, isWritable: true },
-      { pubkey: PUMP_FUN_TOKEN_MINT_AUTHORITY, isSigner: false, isWritable: false },
-      { pubkey: bondingCurve, isSigner: false, isWritable: true },
-      { pubkey: bondingCurveAta, isSigner: false, isWritable: true },
-      { pubkey: PUMP_GLOBAL, isSigner: false, isWritable: false },
-      { pubkey: METAPLEX_PROGRAM, isSigner: false, isWritable: false },
-      { pubkey: metadataPda, isSigner: false, isWritable: true },
-      { pubkey: creator, isSigner: true, isWritable: true },
-      { pubkey: SYSTEM_PROGRAM, isSigner: false, isWritable: false },
-      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      { pubkey: RENT_PROGRAM, isSigner: false, isWritable: false },
-      { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },
-      { pubkey: PUMP_FUN_PROGRAM, isSigner: false, isWritable: false },
-    ],
-    data,
-  });
-}
-
-/**
- * Build a Pump.fun buy instruction
+ * Launch on Pump.fun using the official @pump-fun/pump-sdk.
  *
- * FIX #2: Properly calculates minimum token amount from bonding curve
- * instead of passing 0 (which would revert or return 0 tokens)
- */
-function buildPumpBuyInstruction(
-  buyer: PublicKey,
-  mint: PublicKey,
-  solAmount: number,
-  slippageBps: number,
-  virtualSolReserves: bigint,
-  virtualTokenReserves: bigint
-): TransactionInstruction {
-  const [bondingCurve] = PublicKey.findProgramAddressSync(
-    [Buffer.from("bonding-curve"), mint.toBuffer()],
-    PUMP_FUN_PROGRAM
-  );
-  const bondingCurveAta = getAssociatedTokenAddressSync(mint, bondingCurve, true);
-  const buyerAta = getAssociatedTokenAddressSync(mint, buyer);
-
-  const lamports = BigInt(Math.floor(solAmount * LAMPORTS_PER_SOL));
-
-  // Calculate expected tokens from bonding curve
-  const expectedTokens = calculateTokensOut(lamports, virtualSolReserves, virtualTokenReserves);
-
-  // Apply slippage to get minimum token amount
-  const minTokens = (expectedTokens * BigInt(10000 - slippageBps)) / BigInt(10000);
-
-  // Max SOL cost with slippage
-  const maxSolCost = lamports + (lamports * BigInt(slippageBps)) / BigInt(10000);
-
-  // Buy discriminator
-  const discriminator = Buffer.from([0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea]);
-  const data = Buffer.alloc(8 + 8 + 8);
-  discriminator.copy(data);
-  data.writeBigUInt64LE(minTokens, 8); // FIX #2: actual minimum token amount
-  data.writeBigUInt64LE(maxSolCost, 16);
-
-  return new TransactionInstruction({
-    programId: PUMP_FUN_PROGRAM,
-    keys: [
-      { pubkey: PUMP_GLOBAL, isSigner: false, isWritable: false },
-      { pubkey: PUMP_FEE_RECIPIENT, isSigner: false, isWritable: true },
-      { pubkey: mint, isSigner: false, isWritable: false },
-      { pubkey: bondingCurve, isSigner: false, isWritable: true },
-      { pubkey: bondingCurveAta, isSigner: false, isWritable: true },
-      { pubkey: buyerAta, isSigner: false, isWritable: true },
-      { pubkey: buyer, isSigner: true, isWritable: true },
-      { pubkey: SYSTEM_PROGRAM, isSigner: false, isWritable: false },
-      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      { pubkey: RENT_PROGRAM, isSigner: false, isWritable: false },
-      { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },
-      { pubkey: PUMP_FUN_PROGRAM, isSigner: false, isWritable: false },
-    ],
-    data,
-  });
-}
-
-/**
- * Launch on Pump.fun with local TX construction
- * Returns [mint, transactions[]] for Jito bundling
+ * TX 1: Create mint + Creator buy (via createAndBuyInstructions)
+ * TX 2..N: Bundle buyers purchasing from progressively updated curve state
  *
- * FIX #2: Proper bonding curve math for token amounts
- * FIX #10: Fresh blockhash for each TX
- * FIX #13: Configurable creator buy amount
+ * Returns unsigned VersionedTransactions ready for Jito bundling.
  */
 export async function launchOnPumpFun(
   connection: Connection,
   creator: Keypair,
   buyerWallets: Keypair[]
-): Promise<{ mint: PublicKey; transactions: VersionedTransaction[] }> {
-  log.step("Building Pump.fun launch bundle locally...");
+): Promise<{
+  mint: PublicKey;
+  transactions: VersionedTransaction[];
+  blockhashInfo: BlockhashWithExpiryBlockHeight;
+}> {
+  log.step("Building Pump.fun launch bundle via official SDK...");
 
   const mintKeypair = Keypair.generate();
   const mint = mintKeypair.publicKey;
 
-  // Upload metadata
+  // Upload metadata (Pinata)
   const metadataUri = await uploadMetadata(
     CONFIG.tokenName,
     CONFIG.tokenSymbol,
@@ -201,44 +105,57 @@ export async function launchOnPumpFun(
     CONFIG.tokenImageUrl
   );
 
-  // FIX #10: Get fresh blockhash right before building TXs
-  const blockhash = await connection.getLatestBlockhash("confirmed");
+  const pumpSdk = new PumpSdk();
+  const onlineSdk = new OnlinePumpSdk(connection);
+  const coder = new BorshCoder(pumpIdl as any);
+
+  // Fetch live protocol state — creator buy must match current fee schedule & caps
+  const [global, feeConfig]: [Global, FeeConfig] = await Promise.all([
+    onlineSdk.fetchGlobal(),
+    onlineSdk.fetchFeeConfig(),
+  ]);
+
+  // Single fresh blockhash for all bundle TXs — Jito executes them in one slot
+  const latestBlockhash = await connection.getLatestBlockhash("confirmed");
+
+  // Slippage as decimal (0.05 = 5%), matching SDK convention
+  const slippage = CONFIG.slippageBps / 10_000;
+
   const transactions: VersionedTransaction[] = [];
 
-  // === TX 1: Create token + Creator buy ===
+  // === TX 1: Create + Creator buy ===
 
-  const createIx = buildPumpCreateInstruction(
-    creator.publicKey,
+  const creatorSolLamports = new BN(Math.floor(CONFIG.creatorBuySol * 1e9));
+
+  // Expected token amount the creator will receive — SDK needs this as `amount`
+  const creatorTokenAmount = getBuyTokenAmountFromSolAmount({
+    global,
+    feeConfig,
+    mintSupply: null, // null = pre-creation (fresh curve)
+    bondingCurve: null, // null = use newBondingCurve(global) internally
+    amount: creatorSolLamports,
+  });
+
+  const createIxs = await pumpSdk.createAndBuyInstructions({
+    global,
     mint,
-    CONFIG.tokenName,
-    CONFIG.tokenSymbol,
-    metadataUri
-  );
-
-  // Track virtual reserves as we simulate buys
-  let currentVirtualSol = INITIAL_VIRTUAL_SOL_RESERVES;
-  let currentVirtualTokens = INITIAL_VIRTUAL_TOKEN_RESERVES;
-
-  // FIX #13: Configurable creator buy
-  const creatorBuyIx = buildPumpBuyInstruction(
-    creator.publicKey,
-    mint,
-    CONFIG.creatorBuySol,
-    CONFIG.slippageBps,
-    currentVirtualSol,
-    currentVirtualTokens
-  );
-
-  // Update virtual reserves after creator buy
-  const creatorLamports = BigInt(Math.floor(CONFIG.creatorBuySol * LAMPORTS_PER_SOL));
-  const creatorTokens = calculateTokensOut(creatorLamports, currentVirtualSol, currentVirtualTokens);
-  currentVirtualSol += creatorLamports;
-  currentVirtualTokens -= creatorTokens;
+    name: CONFIG.tokenName,
+    symbol: CONFIG.tokenSymbol,
+    uri: metadataUri,
+    creator: creator.publicKey,
+    user: creator.publicKey,
+    amount: creatorTokenAmount,
+    solAmount: creatorSolLamports,
+  });
 
   const createMsg = new TransactionMessage({
     payerKey: creator.publicKey,
-    recentBlockhash: blockhash.blockhash,
-    instructions: [createIx, creatorBuyIx],
+    recentBlockhash: latestBlockhash.blockhash,
+    instructions: [
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+      ...createIxs,
+    ],
   }).compileToV0Message();
 
   const createTx = new VersionedTransaction(createMsg);
@@ -246,43 +163,70 @@ export async function launchOnPumpFun(
   transactions.push(createTx);
 
   log.info(
-    `Creator buy: ${CONFIG.creatorBuySol} SOL → ~${(Number(creatorTokens) / 1e6).toFixed(0)} tokens`
+    `Creator buy: ${CONFIG.creatorBuySol} SOL → ~${creatorTokenAmount.toString()} raw tokens`
   );
 
-  // === TX 2-N: Bundle buyer transactions ===
-  // Max 3 buyers to stay within Jito 5-tx limit (1 create + 3 buyers + 1 tip)
+  // === Simulate curve progression for bundle buyers ===
+
+  // Start from fresh curve + apply creator buy
+  const liveBc = newBondingCurve(global);
+  liveBc.creator = creator.publicKey;
+
+  {
+    const sim = simulateBuy(
+      liveBc.virtualSolReserves,
+      liveBc.virtualTokenReserves,
+      creatorSolLamports
+    );
+    liveBc.virtualSolReserves = sim.newVsr;
+    liveBc.virtualTokenReserves = sim.newVtr;
+    liveBc.realSolReserves = liveBc.realSolReserves.add(creatorSolLamports);
+    liveBc.realTokenReserves = liveBc.realTokenReserves.sub(sim.tokensOut);
+  }
+
+  // === TX 2..N: Bundle buyers ===
+  // Max 3 buyers to stay under Jito bundle limit: 1 create + 3 buys + 1 tip = 5
+
   const bundleBuyers = buyerWallets.slice(0, Math.min(CONFIG.bundleWalletsCount, 3));
 
   for (const buyer of bundleBuyers) {
-    const buyAmount = randomAmount(0.09, 0.48);
-    const buyLamports = BigInt(Math.floor(buyAmount * LAMPORTS_PER_SOL));
+    const buyAmount = randomAmount(CONFIG.bundleBuyMinSol, CONFIG.bundleBuyMaxSol);
+    const buyLamports = new BN(Math.floor(buyAmount * 1e9));
 
-    const buyerAtaIx = createAssociatedTokenAccountInstruction(
-      buyer.publicKey,
-      getAssociatedTokenAddressSync(mint, buyer.publicKey),
-      buyer.publicKey,
-      mint
-    );
+    // Min tokens acceptable (slippage bound is applied inside the SDK — we pass
+    // the expected amount computed from current simulated curve state).
+    const expectedTokens = getBuyTokenAmountFromSolAmount({
+      global,
+      feeConfig,
+      mintSupply: liveBc.tokenTotalSupply,
+      bondingCurve: { ...liveBc },
+      amount: buyLamports,
+    });
 
-    // FIX #2: Use tracked virtual reserves for accurate token calc
-    const buyIx = buildPumpBuyInstruction(
-      buyer.publicKey,
+    // Build synthetic AccountInfo so buyInstructions treats the curve as already existing
+    const bondingCurveAccountInfo = await encodeBondingCurveAccountInfo(liveBc, coder);
+
+    const buyIxs = await pumpSdk.buyInstructions({
+      global,
+      bondingCurveAccountInfo,
+      bondingCurve: { ...liveBc },
+      associatedUserAccountInfo: null, // SDK creates ATA idempotently
       mint,
-      buyAmount,
-      CONFIG.slippageBps,
-      currentVirtualSol,
-      currentVirtualTokens
-    );
-
-    // Update reserves for next buyer
-    const buyerTokens = calculateTokensOut(buyLamports, currentVirtualSol, currentVirtualTokens);
-    currentVirtualSol += buyLamports;
-    currentVirtualTokens -= buyerTokens;
+      user: buyer.publicKey,
+      amount: expectedTokens,
+      solAmount: buyLamports,
+      slippage,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    });
 
     const buyMsg = new TransactionMessage({
       payerKey: buyer.publicKey,
-      recentBlockhash: blockhash.blockhash,
-      instructions: [buyerAtaIx, buyIx],
+      recentBlockhash: latestBlockhash.blockhash,
+      instructions: [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
+        ...buyIxs,
+      ],
     }).compileToV0Message();
 
     const buyTx = new VersionedTransaction(buyMsg);
@@ -290,13 +234,25 @@ export async function launchOnPumpFun(
     transactions.push(buyTx);
 
     log.info(
-      `Bundle buy: ${buyAmount} SOL → ~${(Number(buyerTokens) / 1e6).toFixed(0)} tokens from ${buyer.publicKey.toBase58().slice(0, 8)}...`
+      `Bundle buy: ${buyAmount} SOL → ~${expectedTokens.toString()} raw tokens from ${buyer.publicKey.toBase58().slice(0, 8)}`
     );
+
+    // Advance simulated curve for next buyer
+    const sim = simulateBuy(
+      liveBc.virtualSolReserves,
+      liveBc.virtualTokenReserves,
+      buyLamports
+    );
+    liveBc.virtualSolReserves = sim.newVsr;
+    liveBc.virtualTokenReserves = sim.newVtr;
+    liveBc.realSolReserves = liveBc.realSolReserves.add(buyLamports);
+    liveBc.realTokenReserves = liveBc.realTokenReserves.sub(sim.tokensOut);
   }
 
   log.success(
     `Pump.fun bundle built: 1 create + ${bundleBuyers.length} buys (mint: ${mint.toBase58()})`
   );
 
-  return { mint, transactions };
+  return { mint, transactions, blockhashInfo: latestBlockhash };
 }
+
